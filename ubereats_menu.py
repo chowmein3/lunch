@@ -3,8 +3,8 @@
 Pull the menu (items, prices, descriptions, photos) from an Uber Eats store page.
 
 Setup:
-    pip install playwright requests
-    playwright install chromium
+    python3 -m pip install playwright requests
+    python3 -m playwright install chromium
 
 Usage:
     python ubereats_menu.py "https://www.ubereats.com/store/<name>/<id>"
