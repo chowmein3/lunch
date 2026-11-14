@@ -30,23 +30,17 @@ import csv
 import json
 import re
 import sys
-from importlib.util import find_spec
 from pathlib import Path
+
+import requests
+from playwright.sync_api import sync_playwright
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
 
-def as_text(value):
-    if isinstance(value, str):
-        return value
-    if isinstance(value, dict):
-        return as_text(value.get("text") or value.get("title"))
-    return ""
-
-
-def slugify(value):
-    return re.sub(r"[^a-z0-9]+", "-", as_text(value).lower()).strip("-") or "item"
+def slugify(s):
+    return re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-") or "item"
 
 
 def find_store(obj):
@@ -82,111 +76,60 @@ def decode_embedded(txt):
 
 
 def get_store(page, captured):
-    stores = [find_store(data) for data in captured]
+    # 1) API responses the page made while loading
+    for data in captured:
+        store = find_store(data)
+        if store:
+            return store
+    # 2) Data embedded in the page's own <script> tags
     scripts = page.eval_on_selector_all("script", "els => els.map(e => e.textContent || '')")
     for text in scripts:
         if "catalogSectionsMap" in text:
             data = decode_embedded(text)
-            store = find_store(data) if data is not None else None
+            store = find_store(data) if data else None
             if store:
-                stores.append(store)
-    stores = [store for store in stores if store]
-    return max(stores, key=catalog_item_count, default=None)
-
-
-def catalog_item_count(store):
-    sections = store.get("catalogSectionsMap")
-    if not isinstance(sections, dict):
-        return 0
-    count = 0
-    for entries in sections.values():
-        if not isinstance(entries, list):
-            continue
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            payload = entry.get("payload")
-            if not isinstance(payload, dict):
-                continue
-            standard = payload.get("standardItemsPayload")
-            if isinstance(standard, dict) and isinstance(standard.get("catalogItems"), list):
-                count += len(standard["catalogItems"])
-    return count
-
-
-def parse_price(item):
-    cents = item.get("price")
-    if isinstance(cents, (int, float)) and not isinstance(cents, bool):
-        return round(cents / 100, 2)
-
-    text = as_text(item.get("priceTagline"))
-    match = re.search(r"(?<!\d)(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?", text)
-    if not match:
-        return None
-    return round(float(match.group(0).replace(",", "")), 2)
+                return store
+    return None
 
 
 def extract_items(store):
     """Turn catalogSectionsMap into a flat list of items."""
-    if not isinstance(store, dict):
-        return []
-    sections = store.get("catalogSectionsMap")
-    if not isinstance(sections, dict):
-        return []
-
     entries = []
-    for section in sections.values():
-        if isinstance(section, list):
-            entries.extend(entry for entry in section if isinstance(entry, dict))
-        elif isinstance(section, dict):
-            entries.append(section)
+    for section in store.get("catalogSectionsMap", {}).values():
+        entries.extend(section or [])
     # Real menu categories are VERTICAL_GRID; horizontal ones repeat "featured" items.
-    entries.sort(key=lambda entry: 0 if entry.get("type") == "VERTICAL_GRID" else 1)
+    entries.sort(key=lambda e: 0 if e.get("type") == "VERTICAL_GRID" else 1)
 
     items, seen = [], set()
     for entry in entries:
-        entry_payload = entry.get("payload")
-        if not isinstance(entry_payload, dict):
-            continue
-        payload = entry_payload.get("standardItemsPayload")
-        if not isinstance(payload, dict):
-            continue
-        category = as_text(payload.get("title")) or "Menu"
-        catalog_items = payload.get("catalogItems")
-        if not isinstance(catalog_items, list):
-            continue
-
-        for it in catalog_items:
-            if not isinstance(it, dict):
-                continue
-            uuid = as_text(it.get("uuid"))
-            name = as_text(it.get("title"))
-            description = as_text(it.get("itemDescription")).replace("\n", " ").strip()
-            image_url = as_text(it.get("imageUrl"))
-            uid = uuid or (category, name, description, image_url)
+        payload = (entry.get("payload") or {}).get("standardItemsPayload") or {}
+        category = ((payload.get("title") or {}).get("text")) or "Menu"
+        for it in payload.get("catalogItems") or []:
+            uid = it.get("uuid") or f"{category}-{it.get('title')}"
             if uid in seen:
                 continue
             seen.add(uid)
+            cents = it.get("price")
+            if cents is None:
+                m = re.search(r"([\d]+(?:\.\d+)?)", (it.get("priceTagline") or {}).get("text") or "")
+                price = float(m.group(1)) if m else 0.0
+            else:
+                price = cents / 100
             items.append({
-                "uuid": uuid,
+                "uuid": it.get("uuid"),
                 "category": category,
-                "name": name,
-                "description": description,
-                "price": parse_price(it),
-                "image_url": image_url,
+                "name": it.get("title") or "",
+                "description": (it.get("itemDescription") or "").replace("\n", " "),
+                "price": round(price, 2),
+                "image_url": it.get("imageUrl") or "",
                 "sold_out": bool(it.get("isSoldOut")),
             })
     return items
 
 
 def download_images(items, out_dir):
-    try:
-        import requests
-    except ImportError as exc:
-        raise SystemExit("Requests is required. Install it with `pip install requests`.") from exc
-
     img_dir = out_dir / "images"
-    img_dir.mkdir(parents=True, exist_ok=True)
+    img_dir.mkdir(exist_ok=True)
     s = requests.Session()
     s.headers["User-Agent"] = UA
     ok = 0
@@ -196,8 +139,6 @@ def download_images(items, out_dir):
         if not url:
             continue
         try:
-            if not url.startswith(("https://", "http://")):
-                raise ValueError("unsupported image URL")
             r = s.get(url, timeout=20)
             r.raise_for_status()
             ctype = r.headers.get("content-type", "")
@@ -206,7 +147,7 @@ def download_images(items, out_dir):
             (img_dir / name).write_bytes(r.content)
             it["image_file"] = f"images/{name}"
             ok += 1
-        except (requests.RequestException, OSError, ValueError) as e:
+        except Exception as e:
             print(f"  image failed for {it['name']}: {e}", file=sys.stderr)
     print(f"Downloaded {ok}/{len(items)} images")
 
@@ -231,11 +172,8 @@ def write_outputs(store_name, items, out_dir):
     for c in cats:
         lines.append(f"# {c}")
         for it in (i for i in items if i["category"] == c):
-            desc = as_text(it.get("description")).replace("|", "/")
-            name = as_text(it.get("name")).replace("|", "/")
-            price = it.get("price")
-            price_text = f"{price:.2f}" if isinstance(price, (int, float)) else ""
-            lines.append(f"{name} | {price_text} | {desc}".rstrip(" |"))
+            desc = it["description"].replace("|", "/")
+            lines.append(f"{it['name'].replace('|', '/')} | {it['price']:.2f} | {desc}".rstrip(" |"))
     (out_dir / "menu_for_app.txt").write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -247,61 +185,34 @@ def main():
     ap.add_argument("--no-images", action="store_true")
     args = ap.parse_args()
 
-    if not args.no_images and find_spec("requests") is None:
-        sys.exit("Requests is required. Install it with `python3 -m pip install requests`.")
-
-    try:
-        from playwright.sync_api import Error as PlaywrightError
-        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        sys.exit(f"Playwright is required. Install it with `python3 -m pip install playwright` "
-                 f"and `python3 -m playwright install chromium`. ({exc})")
-
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     captured = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=args.headless)
+        ctx = browser.new_context(user_agent=UA, locale="en-US", viewport={"width": 1280, "height": 900})
+        page = ctx.new_page()
+
+        def on_response(resp):
+            if "getStoreV1" in resp.url:
+                try:
+                    captured.append(resp.json())
+                except Exception:
+                    pass
+
+        page.on("response", on_response)
+        print(f"Opening {args.url}")
+        page.goto(args.url, wait_until="domcontentloaded", timeout=60000)
+
         store = None
-        try:
-            ctx = browser.new_context(user_agent=UA, locale="en-US",
-                                      viewport={"width": 1280, "height": 900})
-            page = ctx.new_page()
-
-            def on_response(resp):
-                if "getStoreV1" in resp.url:
-                    try:
-                        captured.append(resp.json())
-                    except (PlaywrightError, ValueError):
-                        print(f"Could not read store response: {resp.url}", file=sys.stderr)
-
-            page.on("response", on_response)
-            print(f"Opening {args.url}")
-            try:
-                page.goto(args.url, wait_until="domcontentloaded", timeout=60000)
-            except PlaywrightTimeoutError:
-                print("Page load timed out; checking whether menu data was received.", file=sys.stderr)
-
-            best_count = 0
-            stable_rounds = 0
-            for _ in range(30):
-                page.wait_for_timeout(1000)
-                candidate = get_store(page, captured)
-                count = catalog_item_count(candidate) if candidate else 0
-                if candidate and count >= best_count:
-                    if count == best_count:
-                        stable_rounds += 1
-                    else:
-                        best_count = count
-                        stable_rounds = 0
-                    store = candidate
-                if store and stable_rounds >= 3:
-                    break
-                page.mouse.wheel(0, 1200)
-        finally:
-            browser.close()
+        for _ in range(30):  # up to ~30s, in case of a bot check or slow load
+            page.wait_for_timeout(1000)
+            store = get_store(page, captured)
+            if store:
+                break
+            page.mouse.wheel(0, 1200)  # nudge lazy loading
+        browser.close()
 
     if not store:
         sys.exit("Couldn't find menu data. Uber Eats may have blocked the browser or "
@@ -309,7 +220,7 @@ def main():
                  "manually first to clear any check.")
 
     items = extract_items(store)
-    store_name = as_text(store.get("title")) or as_text(store.get("name")) or "Restaurant"
+    store_name = store.get("title") or "Restaurant"
     print(f"{store_name}: {len(items)} items")
     if not items:
         sys.exit("Found the store but no items. The data layout may have changed.")
